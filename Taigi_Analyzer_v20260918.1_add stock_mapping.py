@@ -64,9 +64,9 @@ def load_taiwan_stock_mapping():
 
 
 def run_app():
-    st.set_page_config(page_title="Tingi股票診斷系統_DUKE設計所有", page_icon="📈", layout="centered")
+    st.set_page_config(page_title="Tengi股票診斷小工具", page_icon="📈", layout="centered")
 
-    st.title("📈 Tingi股票診斷系統")
+    st.title("📈 Tengi股票診斷小工具")
     st.caption("自動計算關卡價位，診斷「起漲蓄勢訊號」與「進行中飆股動能」並精算「最佳進場與停損點」")
 
     # 載入台股名稱與代碼對照
@@ -353,7 +353,7 @@ def run_app():
             st.write(f"{'✅' if c3_breakout else '❌'} **創波段新高**：收盤價突破近 20 日高點")
             st.write(f"{'✅' if c4_momentum else '❌'} **單日強勢攻擊**：單日漲幅 >= +3.0%")
             st.write(f"{'✅' if c5_rsi else '❌'} **RSI 強勢區塊**：RSI(14) >= 55")
-
+            st.caption("© 2026 Your Name. All rights reserved.Copyright © 2026 DUKE 版權所有。©")
 
 if __name__ == "__main__":
     if not st.runtime.exists():
