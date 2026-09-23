@@ -1,4 +1,6 @@
 import sys
+import datetime
+import requests
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -65,20 +67,116 @@ def load_taiwan_stock_mapping():
     return mapping
 
 
-def run_app():
-    st.set_page_config(page_title="TENGI股票診斷小工具", page_icon="📈", layout="centered")
+# =========================================================================
+# 0-1. 自動抓取三大法人最新買賣超數據 (包含當天無資料時自動回溯前一日)
+# =========================================================================
+@st.cache_data(ttl=3600)
+def fetch_taiwan_institutional_data():
+    inst_data = {}
+    data_date_str = ""
 
-    st.title("📈 TENGI股票診斷小工具")
+    def parse_val(v):
+        try:
+            return int(str(v).replace(',', ''))
+        except Exception:
+            return 0
+
+    # 1. 優先透過 OpenAPI 抓取（通常自動為最新交易日資料）
+    try:
+        url_twse = "https://openapi.twse.com.tw/v1/fund/T86"
+        df_twse = pd.read_json(url_twse)
+        if not df_twse.empty and 'Code' in df_twse.columns:
+            if 'Date' in df_twse.columns and not df_twse['Date'].dropna().empty:
+                data_date_str = str(df_twse['Date'].iloc[0])
+
+            for _, row in df_twse.iterrows():
+                code = str(row.get('Code', '')).strip()
+                if code:
+                    foreign = parse_val(row.get('ForeignInvestorsBuySell', row.get('ForeignInvestorsBuy', 0)))
+                    trust = parse_val(row.get('InvestmentTrustBuySell', 0))
+                    dealer = parse_val(row.get('DealerBuySell', row.get('DealerProprietaryBuySell', 0)))
+                    total = parse_val(row.get('TotalBuySell', 0))
+
+                    inst_data[code] = {
+                        'foreign': foreign // 1000,
+                        'trust': trust // 1000,
+                        'dealer': dealer // 1000,
+                        'total': (foreign + trust + dealer) // 1000 if total == 0 else total // 1000,
+                        'date': data_date_str
+                    }
+    except Exception:
+        pass
+
+    # 2. 若 OpenAPI 無回應或空值，向前回溯尋找最近一個有數據的交易日 (最多回溯 7 天)
+    if not inst_data:
+        today = datetime.date.today()
+        for i in range(7):
+            target_date = today - datetime.timedelta(days=i)
+            date_str = target_date.strftime("%Y%m%d")
+            url = f"https://www.twse.com.tw/rwd/zh/fund/T86?date={date_str}&selectType=ALLBUT0999&response=json"
+            try:
+                resp = requests.get(url, timeout=5)
+                if resp.status_code == 200:
+                    res_json = resp.json()
+                    if res_json.get('stat') == 'OK' and 'data' in res_json and len(res_json['data']) > 0:
+                        data_date_str = target_date.strftime("%Y-%m-%d")
+                        for row in res_json['data']:
+                            code = str(row[0]).strip()
+                            if code and code.isdigit() and len(code) == 4:
+                                foreign = parse_val(row[4] if len(row) > 4 else 0)
+                                trust = parse_val(row[7] if len(row) > 7 else 0)
+                                dealer = parse_val(row[10] if len(row) > 10 else 0)
+                                total = parse_val(row[11] if len(row) > 11 else 0)
+                                inst_data[code] = {
+                                    'foreign': foreign // 1000,
+                                    'trust': trust // 1000,
+                                    'dealer': dealer // 1000,
+                                    'total': total // 1000,
+                                    'date': data_date_str
+                                }
+                        break
+            except Exception:
+                continue
+
+    # 3. TPEX 上櫃三大法人買賣超
+    try:
+        url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_33_summary"
+        df_tpex = pd.read_json(url_tpex)
+        if not df_tpex.empty and ('SecuritiesCompanyCode' in df_tpex.columns or 'CompanyCode' in df_tpex.columns):
+            for _, row in df_tpex.iterrows():
+                code = str(row.get('SecuritiesCompanyCode', row.get('CompanyCode', ''))).strip()
+                if code and code not in inst_data:
+                    foreign = parse_val(row.get('ForeignInvestorBuySell', row.get('ForeignInvestorsBuySell', 0)))
+                    trust = parse_val(row.get('InvestmentTrustBuySell', 0))
+                    dealer = parse_val(row.get('DealerBuySell', 0))
+                    total = parse_val(row.get('TotalBuySell', 0))
+
+                    inst_data[code] = {
+                        'foreign': foreign // 1000,
+                        'trust': trust // 1000,
+                        'dealer': dealer // 1000,
+                        'total': (foreign + trust + dealer) // 1000 if total == 0 else total // 1000,
+                        'date': data_date_str
+                    }
+    except Exception:
+        pass
+
+    return inst_data
+
+
+def run_app():
+    st.set_page_config(page_title="TENGI 股票診斷小工具", page_icon="📈", layout="centered")
+
+    st.title("📈 TENGI 股票診斷小工具")
     st.caption("自動計算關卡價位，診斷「起漲蓄勢訊號」與「進行中飆股動能」並精算「最佳進場與停損點」")
 
     # 載入台股名稱與代碼對照
     stock_map = load_taiwan_stock_mapping()
 
-    # 初始化預設輸入值（只需輸入純數字）
+    # 初始化預設輸入值
     if "symbol_text" not in st.session_state:
         st.session_state["symbol_text"] = "2330"
 
-    # 選取選單項目時自動帶入純代碼
     def update_symbol_from_select():
         chosen = st.session_state.get("stock_lookup_select")
         if chosen and chosen != "-- 請選擇或輸入名稱過濾 --":
@@ -108,9 +206,13 @@ def run_app():
     if st.button("開始診斷", type="primary"):
         clean_code = input_symbol.strip().upper().replace(".TW", "").replace(".TWO", "")
 
-        with st.spinner('正在自動尋找股票數據並計算中...'):
+        with st.spinner('正在自動尋找股票數據與三大法人籌碼資料中...'):
             df = pd.DataFrame()
             ticker_used = clean_code
+
+            # 抓取三大法人資料
+            inst_dict = fetch_taiwan_institutional_data()
+            inst_info = inst_dict.get(clean_code, None)
 
             # 若為 4 位數純數字，自動判斷上市 (.TW) 或上櫃 (.TWO)
             if clean_code.isdigit() and len(clean_code) == 4:
@@ -118,7 +220,6 @@ def run_app():
                 cand_two = f"{clean_code}.TWO"
                 all_tickers = set(stock_map.values())
 
-                # 先透過對照表精準打擊
                 if cand_tw in all_tickers:
                     candidates = [cand_tw]
                 elif cand_two in all_tickers:
@@ -126,7 +227,6 @@ def run_app():
                 else:
                     candidates = [cand_tw, cand_two]
 
-                # 嘗試抓取數據
                 for cand in candidates:
                     stk = yf.Ticker(cand)
                     temp_df = stk.history(period="1y")
@@ -135,7 +235,6 @@ def run_app():
                         ticker_used = cand
                         break
             else:
-                # 非 4 位數純數字（如美股 TSLA）
                 stk = yf.Ticker(clean_code)
                 df = stk.history(period="1y")
                 ticker_used = clean_code
@@ -146,7 +245,6 @@ def run_app():
             current_price = df['Close'].iloc[-1]
             prev_close = df['Close'].iloc[-2] if len(df) >= 2 else current_price
 
-            # 反向尋找股票顯示名稱 (若無對照則顯示原始代碼)
             stock_display_name = next((k for k, v in stock_map.items() if v == ticker_used), clean_code)
 
             # =========================================================================
@@ -177,9 +275,7 @@ def run_app():
             local_mins = df.iloc[argrelextrema(df['Low'].values, np.less_equal, order=order)[0]]['Low'].tolist()
             local_maxs = df.iloc[argrelextrema(df['High'].values, np.greater_equal, order=order)[0]]['High'].tolist()
 
-            # -------------------------------------------------------------------------
             # 支撐與壓力候選池
-            # -------------------------------------------------------------------------
             support_pool = [x for x in [df['MA120'].iloc[-1], df['20D_Low'].iloc[-1]] + high_vol_closes + local_mins if
                             not pd.isna(x) and x < current_price]
             resistance_pool = [x for x in high_vol_closes + local_maxs if not pd.isna(x) and x > current_price]
@@ -243,19 +339,13 @@ def run_app():
             # 4. 最佳進場與風控價位精算邏輯
             # =========================================================================
             ma20_val = df['MA20'].iloc[-1]
-
-            # 壓低買進區間：近端支撐價 ~ 月線價 (或現價下方 1%~3%)
             dip_buy_low = near_sup if near_sup else ma20_val * 0.98
             dip_buy_high = min(current_price, max(ma20_val, dip_buy_low * 1.02))
-
-            # 突破加碼點：第一壓力價，若無第一壓力則設為近20日高價
             breakout_buy = first_res if first_res else high_20d
-
-            # 防守停損價：跌破近端支撐 2%，或跌破月線 2%
             stop_loss = (near_sup * 0.98) if near_sup else (ma20_val * 0.97)
 
             # =========================================================================
-            # UI 顯示區：標的、現價、昨收價與支撐壓力卡片
+            # UI 顯示區：標的、現價、昨收價與支撐壓力卡片 (改為紅漲綠跌 inverse 模式)
             # =========================================================================
             st.write("---")
             st.markdown(
@@ -271,6 +361,7 @@ def run_app():
                     label="🛡️ 近端支撐區",
                     value=f"{near_sup:.2f}" if near_sup else "查無數據",
                     delta=f"{((near_sup - current_price) / current_price) * 100:.1f}%" if near_sup else "",
+                    delta_color="inverse"
                 )
                 st.caption("最接近的支撐價位；跌破後結構轉弱。")
             with col2:
@@ -278,6 +369,7 @@ def run_app():
                     label="⚡ 第一壓力區",
                     value=f"{first_res:.2f}" if first_res else "查無數據",
                     delta=f"+{((first_res - current_price) / current_price) * 100:.1f}%" if first_res else "",
+                    delta_color="inverse"
                 )
                 st.caption("現價上方 10% 以內；第一個壓力區。")
             with col3:
@@ -285,8 +377,53 @@ def run_app():
                     label="🔥 第二壓力區",
                     value=f"{second_res:.2f}" if second_res else "查無數據",
                     delta=f"+{((second_res - current_price) / current_price) * 100:.1f}%" if second_res else "",
+                    delta_color="inverse"
                 )
                 st.caption("第一壓力之上；第二壓力區。")
+
+            # =========================================================================
+            # UI 顯示區：三大法人最新籌碼流向 (紅漲綠跌 inverse 模式)
+            # =========================================================================
+            st.write("---")
+            data_date_title = f" ({inst_info['date']})" if (inst_info and inst_info.get('date')) else ""
+            st.subheader(f"🏛️ 三大法人最新籌碼動向 (單位：張){data_date_title}")
+
+            if inst_info:
+                ic1, ic2, ic3, ic4 = st.columns(4)
+                with ic1:
+                    f_val = inst_info['foreign']
+                    st.metric(
+                        label="外資買賣超",
+                        value=f"{f_val:+,} ",
+                        delta="買超" if f_val >= 0 else "-賣超",
+                        delta_color="inverse"
+                    )
+                with ic2:
+                    t_val = inst_info['trust']
+                    st.metric(
+                        label="投信買賣超",
+                        value=f"{t_val:+,} ",
+                        delta="買超" if t_val >= 0 else "-賣超",
+                        delta_color="inverse"
+                    )
+                with ic3:
+                    d_val = inst_info['dealer']
+                    st.metric(
+                        label="自營商買賣超",
+                        value=f"{d_val:+,} ",
+                        delta="買超" if d_val >= 0 else "-賣超",
+                        delta_color="inverse"
+                    )
+                with ic4:
+                    tot_val = inst_info['total']
+                    st.metric(
+                        label="三大法人合計",
+                        value=f"{tot_val:+,} ",
+                        delta="淨買超" if tot_val >= 0 else "-淨賣超",
+                        delta_color="inverse"
+                    )
+            else:
+                st.info("ℹ️ 暫無三大法人籌碼數據（美股標的或交易所當日盤後資料更新中）。")
 
             # =========================================================================
             # UI 顯示區：準備飆漲（起漲前夕診斷）
@@ -357,17 +494,17 @@ def run_app():
             st.write(f"{'✅' if c5_rsi else '❌'} **RSI 強勢區塊**：RSI(14) >= 55")
 
             # =========================================================================
-            # UI 顯示區：近半年日 K 線圖 (包含 5/10/20/60 日均線與成交量)
+            # UI 顯示區：近半年日 K 線圖 (含布林通道、均線與成交量)
             # =========================================================================
             st.write("---")
-            st.markdown("#### 📊 近半年日 K 線與均線成交量圖")
+            st.markdown("#### 📊 近半年日 K 線圖 (含布林通道、均線與成交量)")
             df_chart = df.tail(120).copy()
 
             fig = make_subplots(
                 rows=2, cols=1,
                 shared_xaxes=True,
                 vertical_spacing=0.03,
-                subplot_titles=('日 K 線圖與均線', '成交量'),
+                subplot_titles=('日 K 線圖、布林通道與均線', '成交量'),
                 row_heights=[0.7, 0.3]
             )
 
@@ -385,7 +522,26 @@ def run_app():
                 decreasing_fillcolor='#2ecc71'
             ), row=1, col=1)
 
-            # 2. 均線
+            # 2. 布林通道 (Upper / Lower + 填滿陰影)
+            fig.add_trace(go.Scatter(
+                x=df_chart.index.strftime('%Y-%m-%d'),
+                y=df_chart['BB_Upper'],
+                mode='lines',
+                name='布林上軌 (+2σ)',
+                line=dict(width=1, color='rgba(150, 150, 150, 0.6)', dash='dash')
+            ), row=1, col=1)
+
+            fig.add_trace(go.Scatter(
+                x=df_chart.index.strftime('%Y-%m-%d'),
+                y=df_chart['BB_Lower'],
+                mode='lines',
+                name='布林下軌 (-2σ)',
+                line=dict(width=1, color='rgba(150, 150, 150, 0.6)', dash='dash'),
+                fill='tonexty',
+                fillcolor='rgba(200, 200, 200, 0.15)'
+            ), row=1, col=1)
+
+            # 3. 均線
             ma_colors = {'MA5': '#f39c12', 'MA10': '#3498db', 'MA20': '#9b59b6', 'MA60': '#e67e22'}
             for ma_key, color in ma_colors.items():
                 if ma_key in df_chart.columns:
@@ -397,7 +553,7 @@ def run_app():
                         line=dict(width=1.5, color=color)
                     ), row=1, col=1)
 
-            # 3. 成交量圖
+            # 4. 成交量圖 (紅漲綠跌)
             vol_colors = ['#e74c3c' if c >= o else '#2ecc71' for c, o in zip(df_chart['Close'], df_chart['Open'])]
             fig.add_trace(go.Bar(
                 x=df_chart.index.strftime('%Y-%m-%d'),
@@ -408,7 +564,7 @@ def run_app():
 
             fig.update_layout(
                 xaxis_rangeslider_visible=False,
-                height=550,
+                height=580,
                 margin=dict(l=10, r=10, t=30, b=10),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                 template="plotly_white"
